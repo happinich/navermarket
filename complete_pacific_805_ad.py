@@ -70,28 +70,38 @@ def draw_signature(page) -> None:
     if not box:
         raise RuntimeError("signature canvas has no bounding box")
 
-    # Draw a simple signature-like path. Real pointer events are important here:
-    # directly painting pixels does not always update the app's form state.
     x = box["x"]
     y = box["y"]
     w = box["width"]
     h = box["height"]
-    points = [
-        (0.18, 0.58),
-        (0.27, 0.38),
-        (0.36, 0.63),
-        (0.46, 0.34),
-        (0.56, 0.60),
-        (0.68, 0.42),
-        (0.80, 0.56),
-    ]
-    page.mouse.move(x + w * points[0][0], y + h * points[0][1])
+
+    # Wake up the signature pad's internal "has input" state first, then
+    # redraw the canvas so the only visible signature is the owner name.
+    page.mouse.move(x + w * 0.50, y + h * 0.50)
     page.mouse.down()
-    for px, py in points[1:]:
-        page.mouse.move(x + w * px, y + h * py, steps=8)
+    page.mouse.move(x + w * 0.505, y + h * 0.50, steps=2)
     page.mouse.up()
+
+    canvas.evaluate(
+        """el => {
+            const rect = el.getBoundingClientRect();
+            const ctx = el.getContext('2d');
+            ctx.save();
+            ctx.clearRect(0, 0, el.width, el.height);
+            ctx.scale(el.width / rect.width, el.height / rect.height);
+            ctx.fillStyle = '#111';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.font = `700 ${Math.max(46, Math.floor(rect.height * 0.42))}px "Apple SD Gothic Neo", "Malgun Gothic", sans-serif`;
+            ctx.fillText('이성구', rect.width / 2, rect.height / 2);
+            ctx.restore();
+            for (const type of ['pointerdown', 'pointermove', 'pointerup', 'mousedown', 'mouseup', 'input', 'change']) {
+                el.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }));
+            }
+        }"""
+    )
     time.sleep(0.5)
-    log("signature drawn with mouse events")
+    log("signature owner name drawn: 이성구")
 
 
 def main() -> None:
@@ -114,23 +124,22 @@ def main() -> None:
         page.goto("https://www.gongsilclub.co.kr/", wait_until="load", timeout=30000)
         time.sleep(2)
 
-        if page.get_by_text(K_WEB_OPEN, exact=True).count() > 0 or page.locator(".button-item-2").count() > 0:
+        btn_open_web = page.locator(f"text={K_WEB_OPEN}")
+        if btn_open_web.count() > 0:
             try:
-                with context.expect_page(timeout=3000) as popup_info:
-                    if page.get_by_text(K_WEB_OPEN, exact=True).count() > 0:
-                        page.get_by_text(K_WEB_OPEN, exact=True).first.click(force=True)
-                    else:
-                        page.locator(".button-item-2").first.click(force=True)
-                page = popup_info.value
+                btn_open_web.first.click(timeout=10000)
+                log("clicked web browser entry")
+            except PlaywrightTimeoutError:
+                btn_open_web.first.evaluate("el => el.click()")
+                log("clicked web browser entry via js")
+            time.sleep(5)
+            if len(context.pages) > 1:
+                page = context.pages[-1]
                 page.wait_for_load_state("load", timeout=15000)
                 log("web browser entry opened a new page")
-            except PlaywrightTimeoutError:
-                if page.get_by_text(K_WEB_OPEN, exact=True).count() > 0:
-                    page.get_by_text(K_WEB_OPEN, exact=True).first.click(force=True)
-                else:
-                    page.locator(".button-item-2").first.click(force=True)
-                page.wait_for_load_state("load", timeout=15000)
-                log("web browser entry opened in the same page")
+        else:
+            page.goto("https://www.gongsilclub.co.kr/group/login/", wait_until="load", timeout=30000)
+            log("web browser entry not found; opened login page directly")
             time.sleep(3)
 
         if page.locator("input[placeholder*='ID']").count() == 0:
@@ -215,7 +224,11 @@ def main() -> None:
             raise RuntimeError("signature confirmation button not found")
         time.sleep(4)
 
-        # Confirm the form accepted the signature.
+        if not click_first_visible(page.get_by_text("홍보확인서 첨부", exact=True), "홍보확인서 첨부"):
+            raise RuntimeError("홍보확인서 첨부 button not found")
+        time.sleep(4)
+
+        # Confirm the form accepted and attached the signed promotion document.
         save_state(page, "pacific_805_after_signature_confirm")
 
         click_first_visible(page.get_by_text("Gpay", exact=False), "Gpay option", timeout=3000)
@@ -223,20 +236,37 @@ def main() -> None:
             click_first_visible(page.get_by_text("새로고침", exact=True), "Gpay 새로고침", timeout=3000)
             time.sleep(1)
 
-        agree_text = page.get_by_text(K_PRIVACY, exact=False).first
-        if agree_text.count() > 0:
-            agree_text.click(force=True)
+        terms_card = page.locator(
+            "xpath=//*[contains(text(), '개인정보 수집 및 이용')]/ancestor::div[contains(@style, 'cursor: pointer')][1]"
+        )
+        if terms_card.count() > 0:
+            terms_card.first.scroll_into_view_if_needed(timeout=5000)
+            box = terms_card.first.bounding_box()
+            if not box:
+                raise RuntimeError("terms card has no bounding box")
+            page.mouse.click(box["x"] + 27, box["y"] + 31)
             log("opened/selected 개인정보 동의")
             time.sleep(2)
 
         # If a terms popup opens, accept it.
         if page.get_by_text(K_AGREE).count() > 0:
-            click_first_visible(page.get_by_text(K_AGREE, exact=False), "약관 동의")
+            agree_label = page.get_by_text(K_AGREE, exact=True).last
+            agree_label.wait_for(state="visible", timeout=5000)
+            box = agree_label.bounding_box()
+            if not box:
+                raise RuntimeError("약관 동의 checkbox has no bounding box")
+            page.mouse.click(box["x"] - 24, box["y"] + box["height"] / 2)
+            log("clicked: 약관 동의")
             time.sleep(3)
 
         save_state(page, "pacific_805_before_final_payment")
 
         pay_button = page.locator("div.button").filter(has_text=re.compile(K_PAYMENT)).first
+        page.wait_for_function(
+            """() => [...document.querySelectorAll('div.button')]
+                .some(el => el.textContent.includes('1,900원 결제') && !el.className.includes('disabled'))""",
+            timeout=10000,
+        )
         pay_button.wait_for(state="visible", timeout=10000)
         try:
             pay_button.click(force=True)
